@@ -1,0 +1,38 @@
+[app]
+name = "council-deliberation"
+script = "./task.py"
+source = [
+    "./task.py",
+    "./**/*.py",
+    "requirements.txt",
+]
+import_paths = [
+    ".",
+]
+
+# ── Pipeline Parameters ─────────────────────────────────────────────────
+
+[[parameters]]
+name = "topic"
+description = "The decision topic or question for the council to deliberate on."
+default = "Should the Federal Reserve maintain or cut interest rates in Q3 2026?"
+
+[[parameters]]
+name = "domain"
+description = "Domain of the deliberation: finance, strategy, or general."
+default = "finance"
+
+[[parameters]]
+name = "context"
+description = "Additional context or background information for the deliberation."
+default = ""
+
+[[parameters]]
+name = "fetch_data"
+description = "Whether to fetch external data (SEC, commodity prices) for context."
+default = "true"
+
+[[parameters]]
+name = "output_file"
+description = "Path to write the JSON output file (optional)."
+default = ""
