@@ -32,6 +32,7 @@ from council.models import (
     Post,
     RoomStatus,
 )
+from council.session import DeliberationSession
 
 
 def _generate_agent_id() -> str:
@@ -267,6 +268,114 @@ def _run_summary_phase(
     return summary_content, confidence
 
 
+def session_to_result(session: DeliberationSession) -> DeliberationResult:
+    """Build a DeliberationResult from an in-progress or completed session."""
+    lock_posts = [p for p in session.posts if p.phase == Phase.LOCK]
+    lock_confidences = [p.confidence for p in lock_posts if p.confidence > 0]
+    avg_confidence = (
+        sum(lock_confidences) / len(lock_confidences)
+        if lock_confidences
+        else session.summary_confidence or 0.7
+    )
+
+    return DeliberationResult(
+        topic=session.topic,
+        domain=session.domain,
+        status=RoomStatus.LOCKED if session.is_complete() else RoomStatus.PROVISIONAL,
+        posts=session.posts,
+        final_summary=session.final_summary,
+        quality_score=round(avg_confidence, 2),
+        confidence_score=round(avg_confidence, 2),
+        created_at=session.created_at,
+    )
+
+
+def run_phase(session: DeliberationSession, phase: str, agents: list[AgentConfig] | None = None) -> dict:
+    """Execute a single deliberation phase against shared session state."""
+    agents = agents or AGENTS
+    phase_name = phase.upper().strip()
+
+    if phase_name in session.phases_completed:
+        return {
+            "phase": phase_name,
+            "status": "skipped",
+            "reason": f"Phase {phase_name} already completed.",
+            "phases_remaining": session.phases_remaining(),
+        }
+
+    if phase_name == "ANALYSIS":
+        posts, records = _run_analysis_phase(agents, session.topic, session.domain, session.context)
+        session.posts.extend(posts)
+        session.analysis_records = records
+        session.phases_completed.add("ANALYSIS")
+        return {
+            "phase": "ANALYSIS",
+            "status": "completed",
+            "posts_added": len(posts),
+            "agents": [name for _, name, _ in records],
+            "phases_remaining": session.phases_remaining(),
+        }
+
+    if phase_name == "CHALLENGE":
+        if not session.analysis_records:
+            return {"phase": "CHALLENGE", "status": "error", "error": "Run ANALYSIS first."}
+        posts, challenge_content = _run_challenge_phase(agents, session.topic, session.analysis_records)
+        session.posts.extend(posts)
+        session.challenge_content = challenge_content
+        session.phases_completed.add("CHALLENGE")
+        return {
+            "phase": "CHALLENGE",
+            "status": "completed",
+            "posts_added": len(posts),
+            "phases_remaining": session.phases_remaining(),
+        }
+
+    if phase_name == "VALIDATION":
+        if not session.challenge_content:
+            return {"phase": "VALIDATION", "status": "error", "error": "Run CHALLENGE first."}
+        posts = _run_validation_phase(
+            agents, session.topic, session.analysis_records, session.challenge_content
+        )
+        session.posts.extend(posts)
+        session.phases_completed.add("VALIDATION")
+        return {
+            "phase": "VALIDATION",
+            "status": "completed",
+            "posts_added": len(posts),
+            "phases_remaining": session.phases_remaining(),
+        }
+
+    if phase_name == "LOCK":
+        if "VALIDATION" not in session.phases_completed:
+            return {"phase": "LOCK", "status": "error", "error": "Run VALIDATION first."}
+        posts = _run_lock_phase(agents, session.topic, session.posts)
+        session.posts.extend(posts)
+        session.phases_completed.add("LOCK")
+        return {
+            "phase": "LOCK",
+            "status": "completed",
+            "posts_added": len(posts),
+            "phases_remaining": session.phases_remaining(),
+        }
+
+    if phase_name == "SUMMARY":
+        if "LOCK" not in session.phases_completed:
+            return {"phase": "SUMMARY", "status": "error", "error": "Run LOCK first."}
+        summary, confidence = _run_summary_phase(agents, session.topic, session.domain, session.posts)
+        session.final_summary = summary
+        session.summary_confidence = confidence
+        session.phases_completed.add("SUMMARY")
+        return {
+            "phase": "SUMMARY",
+            "status": "completed",
+            "summary_chars": len(summary),
+            "confidence": confidence,
+            "phases_remaining": session.phases_remaining(),
+        }
+
+    return {"phase": phase_name, "status": "error", "error": f"Unknown phase: {phase_name}"}
+
+
 def run_deliberation(
     topic: str,
     domain: str = "general",
@@ -288,66 +397,9 @@ def run_deliberation(
         A DeliberationResult containing all posts, the final summary, and scores.
     """
     agents = agents or AGENTS
-    start_time = time.time()
+    session = DeliberationSession(topic=topic, domain=domain, context=context)
 
-    print(f"\n{'='*60}")
-    print(f"Council Deliberation — {domain.upper()}")
-    print(f"Topic: {topic}")
-    print(f"Agents: {', '.join(a.name for a in agents)}")
-    print(f"{'='*60}\n")
+    for phase in ["ANALYSIS", "CHALLENGE", "VALIDATION", "LOCK", "SUMMARY"]:
+        run_phase(session, phase, agents=agents)
 
-    all_posts: list[Post] = []
-
-    # Phase 1: ANALYSIS
-    print("[Phase 1] ANALYSIS")
-    analysis_posts, analysis_records = _run_analysis_phase(agents, topic, domain, context)
-    all_posts.extend(analysis_posts)
-
-    # Phase 2: CHALLENGE
-    print("\n[Phase 2] CHALLENGE")
-    challenge_posts, challenge_content = _run_challenge_phase(agents, topic, analysis_records)
-    all_posts.extend(challenge_posts)
-
-    # Phase 3: VALIDATION
-    print("\n[Phase 3] VALIDATION")
-    validation_posts = _run_validation_phase(agents, topic, analysis_records, challenge_content)
-    all_posts.extend(validation_posts)
-
-    # Phase 4: LOCK
-    print("\n[Phase 4] LOCK")
-    lock_posts = _run_lock_phase(agents, topic, all_posts)
-    all_posts.extend(lock_posts)
-
-    # Phase 5: SUMMARY
-    print("\n[Phase 5] SUMMARY")
-    final_summary, summary_confidence = _run_summary_phase(agents, topic, domain, all_posts)
-
-    # Calculate scores
-    lock_confidences = [p.confidence for p in lock_posts if p.confidence > 0]
-    avg_confidence = (
-        sum(lock_confidences) / len(lock_confidences)
-        if lock_confidences
-        else summary_confidence
-    )
-
-    elapsed = time.time() - start_time
-
-    result = DeliberationResult(
-        topic=topic,
-        domain=domain,
-        status=RoomStatus.LOCKED,
-        posts=all_posts,
-        final_summary=final_summary,
-        quality_score=round(avg_confidence, 2),
-        confidence_score=round(avg_confidence, 2),
-        created_at=datetime.utcnow(),
-    )
-
-    print(f"\n{'='*60}")
-    print(f"Deliberation complete in {elapsed:.1f}s")
-    print(f"Posts: {len(all_posts)}")
-    print(f"Quality: {result.quality_score}")
-    print(f"Confidence: {result.confidence_score}")
-    print(f"{'='*60}\n")
-
-    return result
+    return session_to_result(session)

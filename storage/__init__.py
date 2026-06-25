@@ -168,6 +168,22 @@ def save_to_tower(result) -> dict:
     }
 
 
+def query_deliberations(
+    domain: str | None = None,
+    topic_contains: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Filter deliberation history from Tower Iceberg or local JSON files."""
+    rows = read_tower_deliberations()
+    if domain:
+        rows = [row for row in rows if str(row.get("domain", "")).lower() == domain.lower()]
+    if topic_contains:
+        needle = topic_contains.lower()
+        rows = [row for row in rows if needle in str(row.get("topic", "")).lower()]
+    rows = sorted(rows, key=lambda row: str(row.get("created_at", "")), reverse=True)
+    return rows[:limit]
+
+
 def read_tower_deliberations() -> list[dict]:
     """Read all deliberation results from Tower Iceberg."""
     if not HAS_TOWER:

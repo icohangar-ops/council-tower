@@ -29,8 +29,18 @@ default = ""
 
 [[parameters]]
 name = "fetch_data"
-description = "Whether to fetch external data (SEC, commodity prices) for context."
+description = "Whether the Data Agent may fetch external market context."
 default = "true"
+
+[[parameters]]
+name = "mode"
+description = "Execution mode: agent (Data Agent tool loop) or pipeline (legacy fixed flow)."
+default = "agent"
+
+[[parameters]]
+name = "max_agent_steps"
+description = "Maximum tool-calling steps for the Data Agent orchestrator."
+default = "20"
 
 [[parameters]]
 name = "output_file"

@@ -92,9 +92,10 @@ def test_deliberation_protocol():
         _run_validation_phase,
         _run_lock_phase,
         _run_summary_phase,
+        run_phase,
     )
 
-    # Verify all phase functions exist and are callable
+    assert callable(run_phase)
     assert callable(_run_analysis_phase)
     assert callable(_run_challenge_phase)
     assert callable(_run_validation_phase)

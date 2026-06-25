@@ -117,6 +117,32 @@ def call_llm(
     return content or "Analysis could not be generated."
 
 
+def call_llm_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    tool_choice: str = "auto",
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+):
+    """Call the LLM with OpenAI-style tool definitions for the Data Agent loop."""
+    client = get_client()
+    model_name = model or get_model()
+
+    try:
+        return client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=DEFAULT_LLM_TIMEOUT,
+        )
+    except Exception as exc:
+        raise LLMCallError(f"LLM tool call failed: {exc}") from exc
+
+
 def extract_confidence(text: str) -> float:
     """Extract a confidence score (0.0-1.0) from LLM output text.
 

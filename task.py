@@ -1,17 +1,18 @@
 """Council Tower Pipeline — Main orchestration entry point.
 
-This is the script that Tower executes. It:
-  1. Reads parameters (topic, domain, context)
-  2. Optionally fetches real-world data
-  3. Runs the 4-agent council deliberation
-  4. Stores results in Tower Iceberg (or local fallback)
-  5. Prints a structured summary
+Supports two execution modes (Tower parameter ``mode``):
+
+- ``agent`` (default): Tower Data Agent tool loop — query_deliberations,
+  fetch_market_context, run_phase, store_result
+- ``pipeline``: Legacy fixed 3-step pipeline (fetch → deliberate → store)
 
 Usage with Tower:
     tower run --parameter=topic="Should Apple acquire NVIDIA?"
+    tower run --parameter=mode=agent
 
 Usage locally:
     python task.py --topic "Should Apple acquire NVIDIA?" --domain finance
+    python task.py --mode pipeline
 """
 
 import argparse
@@ -21,7 +22,6 @@ import os
 import sys
 import time
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # --- Datadog LLM Observability (no-op unless DD_LLMOBS_ENABLED) ---
@@ -29,36 +29,28 @@ from council.observability import init_observability
 
 init_observability("council-tower")
 
+from council.data_agent import run_data_agent
 from council.deliberation import run_deliberation
 from council.models import DeliberationResult
 from storage import save_result
 
 
 def get_tower_param(name: str, default: str = "") -> str:
-    """Get a parameter from Tower SDK or environment variable.
-
-    Tower injects parameters as environment variables.
-    """
-    # Tower SDK parameter injection
-    try:
-        import tower
-        val = os.environ.get(f"TOWER__PARAMETER__{name.upper()}", "")
-        if val:
-            return val
-    except ImportError:
-        pass
-
-    # Direct environment variable
+    """Get a parameter from Tower SDK or environment variable."""
+    val = os.environ.get(f"TOWER__PARAMETER__{name.upper()}", "")
+    if val:
+        return val
     return os.environ.get(name.upper(), "") or default
 
 
-def print_banner():
+def print_banner(mode: str):
     """Print the Council pipeline banner."""
+    mode_label = "Data Agent" if mode == "agent" else "Fixed Pipeline"
     print()
     print(r"  ╔══════════════════════════════════════════════════╗")
     print(r"  ║                                                  ║")
     print(r"  ║   🏛️  COUNCIL — AI Deliberation Pipeline         ║")
-    print(r"  ║   Tower Pipeline Engine v1.0                      ║")
+    print(f"  ║   Tower {mode_label:<31} ║")
     print(r"  ║                                                  ║")
     print(r"  ╚══════════════════════════════════════════════════╝")
     print()
@@ -77,31 +69,27 @@ def print_result_summary(result: DeliberationResult):
     print(f"  Posts:      {len(result.posts)}")
     print(f"  Time:       {result.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Phase breakdown
     phase_counts = {}
     for post in result.posts:
         phase_counts[post.phase.value] = phase_counts.get(post.phase.value, 0) + 1
-    print(f"\n  Phase Breakdown:")
+    print("\n  Phase Breakdown:")
     for phase, count in sorted(phase_counts.items()):
         print(f"    {phase}: {count} posts")
 
-    # Agent confidence summary
     agent_confidences = {}
     for post in result.posts:
         if post.phase.value == "LOCK":
             agent_confidences[post.agent_name] = post.confidence
     if agent_confidences:
-        print(f"\n  Final Agent Confidences (LOCK phase):")
+        print("\n  Final Agent Confidences (LOCK phase):")
         for name, conf in sorted(agent_confidences.items()):
             bar = "█" * int(conf * 20)
             print(f"    {name:20s} {conf:.2f} {bar}")
 
-    # Final summary
     if result.final_summary:
         print(f"\n  {'─' * 56}")
-        print(f"  COUNCIL RECOMMENDATION:")
+        print("  COUNCIL RECOMMENDATION:")
         print(f"  {'─' * 56}")
-        # Print first 1000 chars of summary
         summary = result.final_summary[:1000]
         for line in summary.split("\n"):
             print(f"  {line}")
@@ -119,70 +107,98 @@ async def fetch_context_async(topic: str, domain: str) -> str:
     except ImportError:
         print("[fetch] Fetcher module not available, skipping data fetch.")
         return ""
-    except Exception as e:
-        print(f"[fetch] Data fetch failed: {e}")
+    except Exception as exc:
+        print(f"[fetch] Data fetch failed: {exc}")
         return ""
+
+
+def run_pipeline_mode(topic: str, domain: str, context: str, fetch_data: bool) -> DeliberationResult:
+    """Legacy fixed pipeline: fetch → run all phases → store."""
+    print("[pipeline] Fetching context data...")
+    context_data = context
+    if fetch_data:
+        fetched = asyncio.run(fetch_context_async(topic, domain))
+        if fetched:
+            context_data = fetched
+            print(f"  Context fetched ({len(context_data)} chars)")
+
+    print("\n[pipeline] Running council deliberation (all phases)...")
+    result = run_deliberation(topic=topic, domain=domain, context=context_data)
+
+    print("\n[pipeline] Storing results...")
+    storage_info = save_result(result)
+    print(f"  Storage: {storage_info}")
+    return result
+
+
+def run_agent_mode(
+    topic: str,
+    domain: str,
+    context: str,
+    fetch_data: bool,
+    max_steps: int,
+) -> tuple[DeliberationResult, dict]:
+    """Tower Data Agent mode with tool-calling orchestration."""
+    print("[data-agent] Starting tool loop...")
+    print("  Tools: query_deliberations, fetch_market_context, run_phase, store_result")
+    session, result, agent_summary = run_data_agent(
+        topic=topic,
+        domain=domain,
+        context=context,
+        fetch_data=fetch_data,
+        max_steps=max_steps,
+    )
+    meta = {
+        "mode": "agent",
+        "agent_summary": agent_summary,
+        "tool_trace": session.tool_trace,
+        "storage": session.storage_info,
+        "phases_completed": sorted(session.phases_completed),
+    }
+    return result, meta
 
 
 def main():
     """Main entry point for the Council Tower Pipeline."""
     parser = argparse.ArgumentParser(description="Council AI Deliberation Pipeline")
     parser.add_argument("--topic", type=str, help="Deliberation topic")
-    parser.add_argument("--domain", type=str, default="general",
-                        help="Domain (finance, strategy, general)")
-    parser.add_argument("--context", type=str, default="",
-                        help="Additional context for the deliberation")
+    parser.add_argument("--domain", type=str, default="general", help="Domain (finance, strategy, general)")
+    parser.add_argument("--context", type=str, default="", help="Additional context")
+    parser.add_argument("--mode", type=str, default="agent", choices=["agent", "pipeline"])
+    parser.add_argument("--max-steps", type=int, default=20, help="Max Data Agent tool loop steps")
 
     args = parser.parse_args()
 
-    # Override with Tower parameters if available
     topic = get_tower_param("topic", args.topic or "")
     domain = get_tower_param("domain", args.domain)
     context = get_tower_param("context", args.context)
+    mode = get_tower_param("mode", args.mode).lower()
+    fetch_data = get_tower_param("fetch_data", "true").lower() in ("1", "true", "yes")
+    max_steps = int(get_tower_param("max_agent_steps", str(args.max_steps)))
 
     if not topic:
-        # Default demo topic
         topic = "Should the Federal Reserve maintain or cut interest rates in Q3 2026?"
         domain = "finance"
         print("[!] No topic provided, using default demo topic.")
 
-    print_banner()
-
+    print_banner(mode)
     start_time = time.time()
 
-    # Step 1: Fetch context data
-    print("[Step 1/3] Fetching context data...")
-    context_data = asyncio.run(fetch_context_async(topic, domain))
-    if context_data:
-        print(f"  Context fetched ({len(context_data)} chars)")
+    agent_meta: dict = {}
+    if mode == "pipeline":
+        result = run_pipeline_mode(topic, domain, context, fetch_data)
+        storage_info = {"mode": "pipeline"}
     else:
-        context_data = context
-        print("  No external context available, proceeding with topic alone.")
+        result, agent_meta = run_agent_mode(topic, domain, context, fetch_data, max_steps)
+        storage_info = agent_meta.get("storage", {})
 
-    # Step 2: Run deliberation
-    print("\n[Step 2/3] Running council deliberation...")
-    result = run_deliberation(
-        topic=topic,
-        domain=domain,
-        context=context_data,
-    )
-
-    # Step 3: Store results
-    print("\n[Step 3/3] Storing results...")
-    storage_info = save_result(result)
-    if storage_info.get("mode") == "tower":
-        print(f"  Stored in Tower Iceberg: {storage_info.get('deliberation_id', 'N/A')}")
-    else:
-        print(f"  Stored locally: {storage_info.get('path', 'N/A')}")
-
-    # Print summary
     elapsed = time.time() - start_time
     print_result_summary(result)
-    print(f"\n  Total pipeline time: {elapsed:.1f}s")
+    print(f"\n  Total runtime: {elapsed:.1f}s | Mode: {mode}")
 
-    # Output JSON for downstream consumers
     output = {
-        "deliberation_id": result.created_at.strftime("%Y%m%d%H%M%S"),
+        "deliberation_id": agent_meta.get("storage", {}).get("deliberation_id")
+        or result.created_at.strftime("%Y%m%d%H%M%S"),
         "topic": result.topic,
         "domain": result.domain,
         "status": result.status.value,
@@ -190,20 +206,21 @@ def main():
         "confidence_score": result.confidence_score,
         "num_posts": len(result.posts),
         "final_summary": result.final_summary,
+        "mode": mode,
         "storage": storage_info,
         "pipeline_time_seconds": round(elapsed, 1),
     }
+    if agent_meta:
+        output["tool_trace"] = agent_meta.get("tool_trace", [])
+        output["agent_summary"] = agent_meta.get("agent_summary", "")
 
-    # Write output JSON
-    output_file = os.environ.get("COUNCIL_OUTPUT_FILE", "")
+    output_file = get_tower_param("output_file", os.environ.get("COUNCIL_OUTPUT_FILE", ""))
     if output_file:
-        with open(output_file, "w") as f:
-            json.dump(output, f, indent=2)
+        with open(output_file, "w") as handle:
+            json.dump(output, handle, indent=2)
         print(f"\n  Output saved to: {output_file}")
 
-    # Print for Tower logs
     print(f"\n[OUTPUT] {json.dumps(output, indent=2)}")
-
     return result
 
 

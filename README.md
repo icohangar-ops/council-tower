@@ -132,6 +132,27 @@ council-tower/
                     └──────────────────┘     └───────────────┘
 ```
 
+## Tower Data Agent (default)
+
+As of v2, Council runs as a [Tower Data Agent](https://docs.tower.dev/docs/concepts/data-agents) — an LLM orchestrator that calls tools in a reasoning loop instead of a fixed 5-phase script.
+
+| Tool | Purpose |
+|------|---------|
+| `query_deliberations` | Read prior results from Iceberg (`council_deliberations`) |
+| `fetch_market_context` | Pull SEC / commodity / news context for the topic |
+| `run_phase` | Execute one council phase (ANALYSIS → SUMMARY) |
+| `store_result` | Write deliberation + posts to Iceberg |
+
+```bash
+# Default: Data Agent mode
+tower run --parameter=topic="Should Apple acquire NVIDIA?" --parameter=domain=finance
+
+# Legacy fixed pipeline
+tower run --parameter=mode=pipeline --parameter=topic="..."
+```
+
+Without an LLM API key, the agent falls back to a **deterministic tool plan** (same four tools, fixed order) so local CI still works.
+
 ## Tower Pipeline Features
 
 - **Parameterized**: Topic, domain, and context are all configurable via Towerfile parameters
@@ -159,7 +180,9 @@ council-tower/
 | `topic` | Deliberation topic/question | (see Towerfile) |
 | `domain` | finance, strategy, or general | `finance` |
 | `context` | Additional context | (empty) |
-| `fetch_data` | Fetch external data | `true` |
+| `mode` | `agent` (Data Agent) or `pipeline` (legacy) | `agent` |
+| `max_agent_steps` | Max tool-calling iterations | `20` |
+| `fetch_data` | Allow market context fetch tool | `true` |
 | `output_file` | JSON output path | (none) |
 
 ## Testing
